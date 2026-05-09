@@ -1,0 +1,532 @@
+---
+title: "Customer Churn Analysis for KoruCharge NZ"
+author: "Dewan Nahidul Alam"
+format: 
+  pdf:
+    fig-cap-location: top 
+    fig-width: 5.5   
+    fig-height: 3.5
+    include-in-header: 
+      text: |
+        \usepackage[justification=raggedright,singlelinecheck=false]{caption}
+editor: visual
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(GGally)
+library(janitor)
+library(discrim)
+library(bonsai)
+library(klaR)
+library(kknn)
+library(ranger)
+library(xgboost)
+library(lightgbm)
+
+# 1. Load the data
+koru_data <- read_csv("korucharge_customers.csv") |> clean_names()
+
+# 2. Data Cleaning (Full Dataset for EDA and Final Model)
+koru_data_clean_full <- koru_data |>
+  mutate(
+    weeks_since_signup = parse_number(weeks_since_signup),
+    avg_kwh_per_session = parse_number(avg_kwh_per_session),
+    peak_share = parse_number(peak_share) / 100,      
+    charger_fault_rate = parse_number(charger_fault_rate) / 100,
+    avg_wait_minutes = parse_number(avg_wait_minutes),
+    weeks_since_last_charge = parse_number(weeks_since_last_charge),
+    retained_binary = factor(retained_binary, levels = c("1", "0"), labels = c("Retained", "Churned")),
+    across(where(is.logical), as.factor),
+    across(where(is.character), as.factor),
+    satisfaction_survey = fct_recode(satisfaction_survey, NULL = "NoResponse")
+  ) |> 
+  dplyr::select(age, gender, region, plan_tier, app_version_lag_weeks, support_ticket, satisfaction_survey,
+                notification_opt_in, email_opened_last, app_crashes_30d, weeks_since_signup, home_charging_access,
+                charging_sessions_12w, avg_kwh_per_session, peak_share, charger_fault_rate, avg_wait_minutes,
+                refund_request_last12w, price_change_exposed, payment_failure_last4w, weeks_since_last_charge,
+                user_id, retained_binary)
+
+# 3. Create a Sample for fast model comparison
+set.seed(123)
+koru_data_clean_sample <- koru_data_clean_full |> slice_sample(n = 10000)
+```
+
+# 1. Introduction
+
+KoruCharge is a nationwide electric vehicle charging network operating across New Zealand. Following a period of rapid expansion, the company has begun to experience rising customer churn, creating challenges for its recurring membership-based revenue model. This report applies predictive business analytics to identify members at risk of cancellation and examine the key factors associated with churn. The findings aim to support data-driven strategies to improve customer retention.
+
+# 2. Dataset Overview
+
+The analysis uses the korucharge_customers dataset, which contains 200,000 customer records and 25 variables that characterize the end-to-end member journey.
+
+The target variable in this analysis is retained_binary, which indicates whether a customer subscribed to the service or cancelled their membership. As shown in Figure 1, 31% of customers churned, while 69% were retained, indicating moderate class imbalance.
+
+```{r}
+#| label: churn-calculation
+#| echo: false
+#| output: false
+
+# Churn Rate Overview
+churn_summary <- koru_data_clean_full |>
+  count(retained_binary) |>
+  mutate(prop = n/sum(n))
+
+print(churn_summary)
+```
+
+```{r}
+#| label: fig-1
+#| fig-cap: "Overall Distribution of Churned and Retained Customers (%)"
+#| fig-width: 5    
+#| fig-height: 3
+
+library(scales)
+
+koru_data_clean_full |> 
+  count(retained_binary) |> 
+  mutate(prop = n / sum(n)) |> 
+  ggplot(aes(x = retained_binary, y = prop, fill = retained_binary)) +
+  geom_col(width = 0.6, alpha = 0.9) + 
+  geom_text(aes(label = percent(prop, accuracy = 1)), vjust = -0.5, fontface = "bold", size = 5) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c("Retained" = "#E0E0E0", "Churned" = "#E63946")) +
+  labs(
+    x = NULL, 
+    y = "Customer share (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "none",              
+    panel.grid.major.x = element_blank(),  
+    axis.text.x = element_text(size = 12, face = "bold") 
+  )
+```
+
+The dataset includes variables describing different aspects of the customer journey. These variables can be grouped into five categories: customer profile, plan information, charging behavior, network experience, and service interaction. For example, variables such as region, plan_tier, charging_sessions_12w, and avg_wait_minutes capture customer characteristics, service usage, and operational conditions relevant to customer retention.
+
+Data preprocessing was conducted to ensure numerical consistency and suitability for analysis. Several variables were stored as text values containing units or percentage symbols. These values were converted into numeric format to ensure consistency for analysis. Percentage variables such as peak_share and charger_fault_rate were further transformed into proportions. The target variable retained_binary was recoded into a categorical variable labelled “Retained” and “Churned”. In addition, logical and character variables were converted into categorical variables for modelling. "NoResponse" entries in satisfaction_survey were recoded as missing values (NA) to ensure statistical consistency and properly account for non-responses.
+
+Exploratory analysis summarized churn distributions across key categorical and numerical variables. Figure 2 presents churn proportions by region, while Figure 3 shows churn proportions across plan tiers. Figure 4 compares the distribution of average wait times between retained and churned customers. Figure 5 displays churn proportions by price change exposure status. These figures provide a descriptive overview of churn patterns and serve as preliminary visual exploration prior to predictive modelling. Higher churn rates appear in certain regions and lower plan tiers, while customers experiencing longer wait times or price change exposure show relatively higher churn proportions.
+
+```{r}
+#| label: fig-2
+#| fig-cap: "Customer Composition by Region (Churned % highlighted)"
+#| fig-pos: "H"
+
+library(scales)
+churn_by_region <- koru_data_clean_full |>
+  group_by(region) |> count(retained_binary) |>
+  mutate(total_customers = sum(n),
+         churn_prop = n/total_customers)
+
+churn_by_region |> 
+  ggplot(aes(x = reorder(region, churn_prop * (retained_binary == "Churned")), 
+             y = churn_prop, 
+             fill = retained_binary)) +
+  geom_col(width = 0.75, alpha = 0.9) + 
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c("Retained" = "#E0E0E0", "Churned" = "#E63946")) +
+  geom_hline(yintercept = mean(koru_data_clean_full$retained_binary == "Churned"), 
+             linetype = "dashed", color = "#8B0000", linewidth = 0.8) +
+  labs(
+    x = NULL, 
+    y = "Customer share within region (%)", 
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 11)
+  )
+```
+
+```{r}
+#| label: fig-3
+#| fig-cap: "Churn Rate (Churned %) by Plan Tier"
+#| fig-pos: "H"
+
+library(scales)
+
+churn_by_plan <- koru_data_clean_full |>
+  group_by(plan_tier) |> count(retained_binary) |>
+  mutate(total_customers = sum(n),
+         churn_prop = n/total_customers)
+
+churn_by_plan |> 
+  ggplot(aes(x = reorder(plan_tier, -churn_prop * (retained_binary == "Churned")), 
+             y = churn_prop, 
+             fill = retained_binary)) +
+  geom_col(width = 0.6, alpha = 0.9) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c("Retained" = "#E0E0E0", "Churned" = "#E63946")) +
+  labs(
+    x = NULL, 
+    y = "Proportion of Customers",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(size = 12, face = "bold")
+  )
+```
+
+```{r}
+#| label: fig-4
+#| fig-cap: "Average Wait Time (minutes) for Churned vs Retained Customers"
+#| fig-pos: "H"
+
+ggplot(koru_data_clean_full, aes(x = retained_binary, y = avg_wait_minutes, fill = retained_binary)) +
+  geom_boxplot(alpha = 0.9, width = 0.5) +
+  scale_fill_manual(values = c("Retained" = "#E0E0E0", "Churned" = "#E63946")) +
+  labs(
+    x = NULL,
+    y = "Average Wait (Minutes)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(size = 12, face = "bold")
+  )
+```
+
+```{r}
+#| label: fig-5
+#| fig-cap: "Churn Rate by Price Change Exposure (%)"
+#| fig-pos: "H"
+
+library(scales)
+
+koru_data_clean_full |>
+  ggplot(aes(x = price_change_exposed, fill = retained_binary)) +
+  geom_bar(position = "fill", width = 0.6, alpha = 0.9) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c("Retained" = "#E0E0E0", "Churned" = "#E63946")) +
+  labs(
+    y = "Customer share within group (%)", 
+    x = "Exposed to Price Change",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(size = 12, face = "bold")
+  )
+```
+
+# 3. Modelling
+
+To evaluate model performance objectively, the cleaned dataset was partitioned into training (70 percent) and testing (30 percent) sets using stratified sampling based on customer status. To prevent overfitting and ensure the robustness of the models on unseen data, a 5 fold cross validation strategy was applied to the training set.
+
+A comprehensive preprocessing recipe was constructed using tidymodels to prepare features for machine learning. First, statistical mode imputation was used to handle missing categorical survey data. Second, we engineered a three way interaction term combining average wait minutes, charger fault rates, and peak usage share. This explicitly tested the founders hypothesis regarding compounding service failures during high demand periods. Third, nominal predictors were converted into dummy variables, zero variance predictors were removed, and all numeric features were normalized using standard scaling. Finally, synthetic upsampling was applied to address the class imbalance, ensuring the algorithms could adequately learn the underlying patterns of the minority Churned class.
+
+```{r}
+#| label: prep-and-train
+#| include: false
+# Note: This chunk runs all the modeling and cross-validation quietly.
+
+# 1. Split the data (70/30 as per sample)
+set.seed(010)
+churn_split <- initial_split(koru_data_clean_sample, prop = 0.70, strata = retained_binary)
+train_data <- training(churn_split)
+test_data  <- testing(churn_split)
+
+# 2. Create Cross-Validation Folds
+cv_folds <- vfold_cv(train_data, v = 5, strata = retained_binary)
+
+# 3. The Recipe
+churn_recipe <- recipe(retained_binary ~ ., data = train_data) |>
+  update_role(user_id, new_role = "ID") |>
+  # Handle missing values in survey if any (step_impute_mode or median)
+  step_impute_mode(satisfaction_survey) |>
+  # Interaction term requested by Case Study: waits x faults x peak usage
+  step_interact(terms = ~ avg_wait_minutes:charger_fault_rate:peak_share) |>
+  # Pre-processing steps from sample
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  # Upsample because Churn is usually the minority
+  step_upsample(retained_binary, over_ratio = 1)
+
+########### Define Model Specifications ###########
+
+# 1. Logistic Regression
+lr_model <- logistic_reg() |> set_engine("glm")
+
+# 2. Naive Bayes
+nb_model <- naive_Bayes() |> set_engine("klaR")
+
+# 3. K-Nearest Neighbours
+knn_model <- nearest_neighbor(neighbors = 5) |> 
+  set_engine("kknn") |> 
+  set_mode("classification")
+
+# 4. Random Forest
+rf_model <- rand_forest(trees = 1000) |> 
+  set_engine("ranger", importance = "impurity") |> 
+  set_mode("classification")
+
+# 5. XGBoost
+xgb_model <- boost_tree() |> 
+  set_engine("xgboost") |> 
+  set_mode("classification")
+
+# 6. LightGBM
+lgbm_model <- boost_tree() |> 
+  set_engine("lightgbm") |> 
+  set_mode("classification")
+
+########### Create Workflows ###########
+
+lr_wflow   <- workflow() |> add_model(lr_model)   |> add_recipe(churn_recipe)
+nb_wflow   <- workflow() |> add_model(nb_model)   |> add_recipe(churn_recipe)
+knn_wflow  <- workflow() |> add_model(knn_model)  |> add_recipe(churn_recipe)
+rf_wflow   <- workflow() |> add_model(rf_model)   |> add_recipe(churn_recipe)
+xgb_wflow  <- workflow() |> add_model(xgb_model)  |> add_recipe(churn_recipe)
+lgbm_wflow <- workflow() |> add_model(lgbm_model) |> add_recipe(churn_recipe)
+
+########### Define the Metric Set ###########
+
+churn_metrics <- metric_set(
+  accuracy,
+  roc_auc,
+  metric_tweak("sens2", sens, event_level = "second"),
+  metric_tweak("spec2", spec, event_level = "second")
+)
+
+########### Fit Models to Training Data (Cross-Validation) ###########
+
+# Control object to save predictions for ROC curves later
+ctrl <- control_grid(save_pred = TRUE, parallel_over = "everything")
+
+# Run resamples for each
+lr_res   <- lr_wflow   |> fit_resamples(resamples = cv_folds, metrics = churn_metrics, control = ctrl)
+nb_res   <- nb_wflow   |> fit_resamples(resamples = cv_folds, metrics = churn_metrics, control = ctrl)
+knn_res  <- knn_wflow  |> fit_resamples(resamples = cv_folds, metrics = churn_metrics, control = ctrl)
+rf_res   <- rf_wflow   |> fit_resamples(resamples = cv_folds, metrics = churn_metrics, control = ctrl)
+xgb_res  <- xgb_wflow  |> fit_resamples(resamples = cv_folds, metrics = churn_metrics, control = ctrl)
+lgbm_res <- lgbm_wflow |> fit_resamples(resamples = cv_folds, metrics = churn_metrics, control = ctrl)
+
+# Combine all results into one table
+all_results <- bind_rows(
+  lr_res   |> collect_metrics() |> mutate(model = "Logistic Regression"),
+  nb_res   |> collect_metrics() |> mutate(model = "Naive Bayes"),
+  knn_res  |> collect_metrics() |> mutate(model = "KNN"),
+  rf_res   |> collect_metrics() |> mutate(model = "Random Forest"),
+  xgb_res  |> collect_metrics() |> mutate(model = "XGBoost"),
+  lgbm_res |> collect_metrics() |> mutate(model = "LightGBM")
+)
+
+all_pred <-
+  bind_rows(
+    lr_res |> collect_predictions() |> mutate(model = "Logistic Regression"),
+    nb_res |> collect_predictions() |> mutate(model = "Naive Bayes"),
+    knn_res |> collect_predictions() |> mutate(model = "KNN"),
+    rf_res |> collect_predictions() |> mutate(model = "Random Forest"),
+    xgb_res |> collect_predictions() |> mutate(model = "XGBoost"),
+    lgbm_res |> collect_predictions() |> mutate(model = "LightGBM")
+  )
+```
+
+We evaluated six algorithms including Logistic Regression, Random Forest, and XGBoost. Table 1 summarizes the cross-validation performance, and Figure 6 illustrates their ROC curves.
+
+```{r}
+#| label: tbl-model-perf
+#| tbl-cap: "Cross-Validation Performance Metrics by Algorithm"
+#| tbl-colwidths: [28, 18, 18, 18, 18]
+#| echo: false
+#| message: false
+#| warning: false
+
+library(knitr)
+library(tidyr)
+library(dplyr)
+
+perf_table <- all_results |>
+  as.data.frame() |> 
+  filter(.metric %in% c("accuracy", "roc_auc", "sens2", "spec2")) |>
+  group_by(model, .metric) |>
+  summarise(mean = mean(mean, na.rm = TRUE), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = .metric, values_from = mean) |>
+  rename(
+    Model = model,
+    `Accuracy` = accuracy,
+    `ROC AUC` = roc_auc,
+    `Sensitivity (Churn)` = sens2,
+    `Specificity (Retain)` = spec2
+  ) |>
+  arrange(desc(`ROC AUC`))
+
+kable(perf_table, format = "markdown", align = "lcccc", digits = 3)
+```
+
+```{r}
+#| label: fig-6
+#| fig-cap: "ROC Curves by Fold for Evaluated Algorithms"
+
+
+# inspect results
+all_pred |>
+  group_by(id,model) |>   # id contains the folds
+  roc_curve(retained_binary, .pred_Churned, event_level = "second") |>
+  autoplot(aes(col = model)) + 
+  facet_wrap(facets = vars(model)) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8) 
+  )
+```
+
+Upon evaluating these cross validation metrics, Logistic Regression was selected as the final production model because it delivered the best comprehensive performance across Accuracy, ROC AUC, Sensitivity, and Specificity. In addition to outperforming the advanced tree based models, logistic regression provides explicit odds ratios. This allows us to translate mathematical feature weights into clear, actionable business drivers for audiences without technical backgrounds.
+
+This modelling approach inherently assumes that the impact of each customer variable (such as wait times or payment failures) acts additively and independently to influence overall churn risk. Furthermore, it assumes that the historical behavioural patterns captured in this dataset will remain reliable and consistent indicators of future cancellation risks.
+
+```{r}
+#| label: final-model-fit
+#| include: false
+
+# Split the data (70/30 on original data)
+set.seed(032)
+churn_split_final <- initial_split(koru_data_clean_full, prop = 0.70, strata = retained_binary)
+train_data_full <- training(churn_split_final)
+test_data_full  <- testing(churn_split_final)
+
+# Create Cross-Validation Folds
+cv_folds_full <- vfold_cv(train_data_full, v = 5, strata = retained_binary)
+
+# The Recipe
+churn_recipe_final <- recipe(retained_binary ~ ., data = train_data_full) |>
+  update_role(user_id, new_role = "ID") |>
+  step_impute_mode(satisfaction_survey) |>
+  step_interact(terms = ~ avg_wait_minutes:charger_fault_rate:peak_share) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_upsample(retained_binary, over_ratio = 1)
+
+# Create New LR Workflow
+lr_wflow_final <- workflow() |>
+  add_model(lr_model)  |>
+  add_recipe(churn_recipe_final)
+
+# Finalize the workflow with LR model
+final_lr_fit <- last_fit(lr_wflow_final, churn_split_final, metrics = churn_metrics)
+
+final_fitted_model <- extract_workflow(final_lr_fit)
+
+lr_pred_final <- predict(final_fitted_model, test_data_full, type = "prob") |>
+  bind_cols(
+    predict(final_fitted_model, test_data_full, type = "class"),
+    test_data_full |> dplyr::select(retained_binary) 
+  )
+```
+
+The final model was fitted to the full training data and evaluated on the unseen test set. Overall classification performance is visually summarized by the ROC curve in Figure 7. Furthermore, the confusion matrix in Figure 8 demonstrates the model's practical business value. By successfully identifying true churners and minimizing false negatives, the model ensures that KoruCharge can effectively target the right customers for proactive retention campaigns.
+
+```{r}
+#| label: fig-7
+#| fig-cap: "ROC Curve for Final Logistic Regression Model"
+#| fig-width: 5    
+#| fig-height: 3
+
+# ROC curve
+lr_pred_final |>
+  roc_curve(truth = retained_binary,
+            .pred_Churned,
+            event_level = "second") |>
+  autoplot()
+```
+
+```{r}
+#| label: fig-8
+#| fig-cap: "Confusion Matrix on the Final Test Dataset"
+#| fig-width: 4.5    
+#| fig-height: 3.5
+
+# Create a Confusion Matrix
+final_lr_fit |>
+  collect_predictions() |>
+  conf_mat(truth = retained_binary, estimate = .pred_class) |>
+  autoplot(type = "heatmap") 
+```
+
+Figure 9 extracts the variable importance from the final model, highlighting the top drivers across three business themes. Engagement risk is the most dominant, with weeks since last charge acting as the primary churn predictor. Operational and commercial friction follow closely, driven by payment failures in the last four weeks, average wait minutes, and refund requests. Conversely, retention assets such as frequent charging sessions, email engagement, and high satisfaction scores act as powerful loyalty promoters.
+
+```{r}
+#| label: fig-9
+#| fig-cap: "Variable Importance: Top Drivers of Churn vs. Retention"
+#| fig-pos: "H"
+
+top_vars <- final_lr_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(term != "(Intercept)") |>
+  arrange(p.value) 
+
+# 1. Prepare the data for the Top 10 only (5 churn, 5 retention)
+top_10_drivers <- top_vars |>
+  mutate(
+    odds_ratio = exp(estimate),
+    direction = ifelse(estimate > 0, "Increase churn", "Reduce churn"),
+    # Calculate absolute impact to find the strongest drivers regardless of direction
+    abs_impact = abs(estimate) 
+  ) |>
+  group_by(direction) |>
+  # Take the 5 strongest for each group
+  slice_max(abs_impact, n = 5) |> 
+  ungroup()
+
+# 2. Create the plot
+ggplot(top_10_drivers,
+       aes(x = reorder(term, odds_ratio),
+           y = odds_ratio,
+           fill = direction)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  coord_flip() +
+  scale_y_log10() +
+  scale_fill_manual(values = c("Increase churn" = "#e41a1c", "Reduce churn" = "#377eb8")) +
+  labs(
+    subtitle = "Odds Ratio > 1 increases churn risk | Odds Ratio < 1 promotes retention",
+    x = "Variable",
+    y = "Odds Ratio (Impact Strength on Log Scale)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.subtitle = element_text(hjust = 0, size = 10),
+    plot.title.position = "plot",  
+    legend.title = element_blank(),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+# 4. Conclusions and Recommendations
+
+To stabilize KoruCharge and combat churn, we recommend four strategies:
+
+-   Automated Re-engagement: Deploy campaigns for users inactive over 21 days.
+
+-   Payment Resilience: Implement a 48-hour grace period for failed transactions.
+
+-   Targeted Infrastructure: Install Hyper-chargers in bottleneck regions.
+
+-   Proactive Recovery: Instantly resolve issues for low-satisfaction users.
+
+These actions will eliminate silent churn, restore reliability, and transform KoruCharge into a loyal daily habit.
