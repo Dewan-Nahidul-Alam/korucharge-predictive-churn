@@ -74,18 +74,6 @@ The analysis enabled KoruCharge management to better understand customer churn b
 
 ---
 
-## 📂 Repository Structure
-
-```bash
-├── data/
-├── scripts/
-├── visualizations/
-├── reports/
-└── README.md
-```
-
----
-
 ## 🔗 Connect With Me
 
 [LinkedIn](https://www.linkedin.com/in/dewan-nahidul-alam-niloy/)  
