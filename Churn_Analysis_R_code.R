@@ -1,11 +1,15 @@
 # Install required libraries and load
 library(tidyverse)
 library(tidymodels)
+library(knitr)
+library(tidyr)
+library(dplyr)
 library(themis)
 library(GGally)
 library(janitor)
 library(discrim)
 library(bonsai)
+library(scales)
 library(klaR)
 library(kknn)
 library(ranger)
@@ -40,11 +44,6 @@ set.seed(123)
 koru_data_clean_sample <- koru_data_clean_full |> slice_sample(n = 10000)
 
 
-
-
-
-
-
 # Churn Rate Overview
 churn_summary <- koru_data_clean_full |>
   count(retained_binary) |>
@@ -52,8 +51,6 @@ churn_summary <- koru_data_clean_full |>
 
 print(churn_summary)
 
-
-ibrary(scales)
 
 koru_data_clean_full |> 
   count(retained_binary) |> 
@@ -203,6 +200,8 @@ churn_recipe <- recipe(retained_binary ~ ., data = train_data) |>
   # Upsample because Churn is usually the minority
   step_upsample(retained_binary, over_ratio = 1)
 
+
+
 ########### Define Model Specifications ###########
 
 # 1. Logistic Regression
@@ -231,6 +230,8 @@ lgbm_model <- boost_tree() |>
   set_engine("lightgbm") |> 
   set_mode("classification")
 
+
+
 ########### Create Workflows ###########
 
 lr_wflow   <- workflow() |> add_model(lr_model)   |> add_recipe(churn_recipe)
@@ -240,6 +241,8 @@ rf_wflow   <- workflow() |> add_model(rf_model)   |> add_recipe(churn_recipe)
 xgb_wflow  <- workflow() |> add_model(xgb_model)  |> add_recipe(churn_recipe)
 lgbm_wflow <- workflow() |> add_model(lgbm_model) |> add_recipe(churn_recipe)
 
+
+
 ########### Define the Metric Set ###########
 
 churn_metrics <- metric_set(
@@ -248,6 +251,8 @@ churn_metrics <- metric_set(
   metric_tweak("sens2", sens, event_level = "second"),
   metric_tweak("spec2", spec, event_level = "second")
 )
+
+
 
 ########### Fit Models to Training Data (Cross-Validation) ###########
 
@@ -283,11 +288,8 @@ all_pred <-
   )
 
 
-########### Cross-Validation Performance Metrics by Algorithm ###########
 
-library(knitr)
-library(tidyr)
-library(dplyr)
+########### Cross-Validation Performance Metrics by Algorithm ###########
 
 perf_table <- all_results |>
   as.data.frame() |> 
@@ -370,12 +372,14 @@ lr_pred_final |>
   autoplot()
 
 
+
 ########### Confusion Matrix on the Final Test Dataset ###########
 
 final_lr_fit |>
   collect_predictions() |>
   conf_mat(truth = retained_binary, estimate = .pred_class) |>
   autoplot(type = "heatmap") 
+
 
 
 ###########################################################################
